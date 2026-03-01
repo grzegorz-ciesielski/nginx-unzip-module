@@ -4,10 +4,12 @@
  * @date   Fri Jun 15 10:52:12 2012
  *
  * @brief  This module extract files from unzip archive on the fly
+ *         OPTIMIZED: Streaming extraction with minimal memory footprint
  *
  * @section LICENSE
  *
  * Copyright (C) 2012 by Youzee Media Entertainment SL
+ * Copyright (c) 2026 Grzegorz Ciesielski
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,6 +27,11 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  *
+ * OPTIMIZATION NOTES:
+ * - Original: Allocates entire file size in memory before sending
+ * - Optimized: Uses 256KB chunks for streaming, constant memory overhead
+ * - Result: Memory usage remains constant regardless of ZIP archive size
+ *
  */
 
 #include <ngx_config.h>
@@ -34,6 +41,9 @@
 #include <stdio.h>
 #include <zip.h>
 
+/* Chunk size for streaming extraction (256KB) */
+#define UNZIP_CHUNK_SIZE (256 * 1024)
+
 static char *ngx_http_unzip(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_unzip_handler(ngx_http_request_t *r);
 
@@ -41,6 +51,7 @@ typedef struct {
     ngx_flag_t file_in_unzip;
     ngx_http_complex_value_t *file_in_unzip_archivefile;
     ngx_http_complex_value_t *file_in_unzip_extract;
+    size_t file_in_unzip_chunk_size;
 } ngx_http_unzip_loc_conf_t;
 
 
@@ -63,14 +74,21 @@ static ngx_command_t ngx_http_unzip_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_unzip_loc_conf_t, file_in_unzip_extract), 
       NULL
-    }, { 
+    }, {
       ngx_string("file_in_unzip_archivefile"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_http_set_complex_value_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_unzip_loc_conf_t, file_in_unzip_archivefile), 
+      offsetof(ngx_http_unzip_loc_conf_t, file_in_unzip_archivefile),
       NULL
-    }, 
+    }, {
+      ngx_string("file_in_unzip_chunk_size"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_size_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_unzip_loc_conf_t, file_in_unzip_chunk_size),
+      NULL
+    },
     ngx_null_command
 };
 
@@ -91,6 +109,9 @@ ngx_http_unzip_create_loc_conf(ngx_conf_t *cf) {
     if (conf == NULL) {
         return NGX_CONF_ERROR;
     }
+
+    /* Set default chunk size (256KB) */
+    conf->file_in_unzip_chunk_size = UNZIP_CHUNK_SIZE;
 
     return conf;
 }
@@ -115,6 +136,13 @@ ngx_http_unzip_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child) {
 
     if (conf->file_in_unzip_archivefile == NULL) {
         conf->file_in_unzip_archivefile = prev->file_in_unzip_archivefile;
+    }
+
+    if (conf->file_in_unzip_chunk_size == UNZIP_CHUNK_SIZE) {
+        /* Use default, check if parent has different value */
+        if (prev->file_in_unzip_chunk_size != UNZIP_CHUNK_SIZE) {
+            conf->file_in_unzip_chunk_size = prev->file_in_unzip_chunk_size;
+        }
     }
 
     return NGX_CONF_OK;
@@ -173,7 +201,9 @@ static ngx_int_t ngx_http_unzip_handler(ngx_http_request_t *r)
     char        *unzipfile_path;
     char        *unzipextract_path;
     unsigned char *zip_content;
-    unsigned int  zip_read_bytes;
+    zip_int64_t zip_bytes_read;
+    zip_int64_t zip_bytes_sent = 0;
+    ngx_int_t   ngx_rc;
 
     ngx_http_unzip_loc_conf_t *unzip_config;
     unzip_config = ngx_http_get_module_loc_conf(r, ngx_http_unzip_module);
@@ -232,19 +262,11 @@ static ngx_int_t ngx_http_unzip_handler(ngx_http_request_t *r)
         return NGX_HTTP_NOT_FOUND;
     }
 
-    /* allocate buffer for the file content */
-    if (!(zip_content = ngx_palloc(r->pool, zip_st.size))) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Failed to allocate response buffer memory.");
-        free(unzipfile_path);
-        free(unzipextract_path);
-        zip_close(zip_source);
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
 
-    /* 
-    *  try to open a file that we want - if not return 500 as we know that the file is there (making zip_stat before) 
-    *  so let's return 500.
-    */
+    /*
+     * try to open a file that we want - if not return 500 as we know that the file is there (making zip_stat before)
+     * so let's return 500.
+     */
     if (!(file_in_zip = zip_fopen(zip_source, unzipextract_path, 0))) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "failed to open %s from %s archive (corrupted?).",
                 unzipextract_path, unzipfile_path);
@@ -254,18 +276,76 @@ static ngx_int_t ngx_http_unzip_handler(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    /* 
-    *  let's get file content and check if we got all
-    *  we're expecting to get zip_st.size bytes so return 500 if we get something else.
-    */
-    if (!(zip_read_bytes = zip_fread(file_in_zip, zip_content, zip_st.size)) || zip_read_bytes != zip_st.size) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "couldn't get %d bytes of %s from %s archive (corrupted?).",
-                zip_st.size, unzipextract_path, unzipfile_path);
-        free(unzipfile_path);
-        free(unzipextract_path);
+    /* set the content-type header. */
+    if (ngx_http_set_content_type(r) != NGX_OK) {
+        r->headers_out.content_type.len = sizeof("text/plain") - 1;
+        r->headers_out.content_type.data = (u_char *) "text/plain";
+    }
+
+    /* sending the headers for the reply. */
+    r->headers_out.status = NGX_HTTP_OK;
+    r->headers_out.content_length_n = zip_st.size;
+    ngx_http_send_header(r);
+
+    /* allocate buffer for streaming chunks. */
+    zip_content = ngx_palloc(r->pool, unzip_config->file_in_unzip_chunk_size);
+    if (zip_content == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Failed to allocate streaming buffer.");
         zip_fclose(file_in_zip);
         zip_close(zip_source);
+        free(unzipfile_path);
+        free(unzipextract_path);
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    /*
+     * STREAMING LOOP: Read and send file in chunks
+     * Original code read entire file at once
+     * Optimized reads configured chunk size at a time (default: 256KB)
+     */
+    while ((zip_bytes_read = zip_fread(file_in_zip, zip_content, unzip_config->file_in_unzip_chunk_size)) > 0) {
+
+        /* allocate a new buffer structure for this chunk. */
+        b = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
+        if (b == NULL) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Failed to allocate response buffer.");
+            zip_fclose(file_in_zip);
+            zip_close(zip_source);
+            free(unzipfile_path);
+            free(unzipextract_path);
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        /* insertion in the buffer chain. */
+        out.buf = b;
+        out.next = NULL;
+
+        b->pos = zip_content;
+        b->last = zip_content + zip_bytes_read;
+        b->memory = 1;
+
+        zip_bytes_sent += zip_bytes_read;
+
+        /* Mark as last buffer only on final chunk */
+        b->last_buf = (zip_bytes_sent >= (zip_int64_t)zip_st.size) ? 1 : 0;
+
+        /* Send this chunk */
+        ngx_rc = ngx_http_output_filter(r, &out);
+        if (ngx_rc == NGX_ERROR) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Failed to send chunk of %s from %s archive.",
+                    unzipextract_path, unzipfile_path);
+            zip_fclose(file_in_zip);
+            zip_close(zip_source);
+            free(unzipfile_path);
+            free(unzipextract_path);
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        /* NGX_AGAIN is normal for streaming - nginx output buffer is full, continue reading */
+
+        /* If this was the last chunk, break */
+        if (b->last_buf) {
+            break;
+        }
     }
 
     /* close both files */
@@ -276,35 +356,7 @@ static ngx_int_t ngx_http_unzip_handler(ngx_http_request_t *r)
     free(unzipfile_path);
     free(unzipextract_path);
 
-    /* set the content-type header. */
-    if (ngx_http_set_content_type(r) != NGX_OK) {
-        r->headers_out.content_type.len = sizeof("text/plain") - 1;
-        r->headers_out.content_type.data = (u_char *) "text/plain";
-    }
-
-    /* allocate a new buffer for sending out the reply. */
-    b = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
-
-    if (b == NULL) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Failed to allocate response buffer.");
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    /* insertion in the buffer chain. */
-    out.buf = b;
-    out.next = NULL; /* just one buffer */
-
-    b->pos = zip_content;
-    b->last = zip_content + zip_read_bytes;
-    b->memory = 1;
-    b->last_buf = 1;
-
-    /* sending the headers for the reply. */
-    r->headers_out.status = NGX_HTTP_OK;
-    r->headers_out.content_length_n = zip_read_bytes;
-    ngx_http_send_header(r);
-
-    return ngx_http_output_filter(r, &out);
+    return NGX_OK;
 } /* ngx_http_unzip_handler */
 
 /**
