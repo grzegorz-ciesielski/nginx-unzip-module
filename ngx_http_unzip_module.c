@@ -276,11 +276,34 @@ static ngx_int_t ngx_http_unzip_handler(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    /* set the content-type header. */
-    if (ngx_http_set_content_type(r) != NGX_OK) {
-        r->headers_out.content_type.len = sizeof("text/plain") - 1;
-        r->headers_out.content_type.data = (u_char *) "text/plain";
+    /* set the content-type header based on extracted file extension using nginx's types. */
+    ngx_http_core_loc_conf_t *clcf;
+    ngx_str_t filename;
+    ngx_str_t *type;
+    char *ext;
+    ngx_uint_t hash;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+
+    filename.data = (u_char *) unzipextract_path;
+    filename.len = strlen(unzipextract_path);
+
+    ext = strrchr(unzipextract_path, '.');
+    if (ext != NULL) {
+        filename.data = (u_char *) ext;
+        filename.len = strlen(ext);
+        hash = ngx_hash_key_lc(filename.data, filename.len);
+        type = ngx_hash_find(&clcf->types_hash, hash, filename.data, filename.len);
+    } else {
+        type = NULL;
     }
+
+    if (type == NULL) {
+        type = &clcf->default_type;
+    }
+
+    r->headers_out.content_type.len = type->len;
+    r->headers_out.content_type.data = type->data;
 
     /* sending the headers for the reply. */
     r->headers_out.status = NGX_HTTP_OK;
